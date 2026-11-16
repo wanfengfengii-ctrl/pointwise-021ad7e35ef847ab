@@ -1,9 +1,17 @@
-"""Version-1 registry, batch intake and atomic result publication."""
+"""Registry, batch intake and atomic result publication.
+
+Storage version 1 keeps the original SDK1 AST tables and interpreter path
+unchanged. After migration (storage version 2) the same public classes read
+and write the native SDK2 tables installed by ``sdk2.install``; the legacy
+tables are retained for audit only and are never read on the run path.
+"""
 import sqlite3
 from contextlib import contextmanager
 
 import sdk1
+import sdk2
 from common import dumps, loads, tables_copy
+from compiler import compile_plan
 
 
 def connect(path=":memory:"):
@@ -48,6 +56,10 @@ def _legacy(db):
         raise ValueError("this adapter requires storage version 1")
 
 
+def _migrated(db):
+    return storage_version(db) == 2
+
+
 def _name(name):
     if not isinstance(name, str) or not name:
         raise ValueError("nonempty identifier required")
@@ -59,6 +71,14 @@ class Registry:
 
     def save(self, rule_id, plan):
         _name(rule_id)
+        if _migrated(self.db):
+            # The public entry still accepts SDK1 rules; the legacy validator
+            # validates the input, but only the compiled SDK2 DAG is stored.
+            sdk1.validate(plan)
+            target = compile_plan(plan)
+            with transaction(self.db):
+                sdk2.save_plan(self.db, rule_id, target)
+            return
         sdk1.validate(plan)
         encoded = dumps(plan)
         with transaction(self.db):
@@ -68,6 +88,9 @@ class Registry:
                             (rule_id, encoded))
 
     def get(self, rule_id):
+        if _migrated(self.db):
+            # Detached, independently executable SDK2 DAG; never the old AST.
+            return sdk2.get_plan(self.db, rule_id)
         _legacy(self.db)
         row = self.db.execute("SELECT ast_json FROM rules_v1 WHERE rule_id=?", (rule_id,)).fetchone()
         if row is None:
@@ -76,6 +99,11 @@ class Registry:
 
     def bind(self, task_id, rule_id):
         _name(task_id)
+        if _migrated(self.db):
+            with transaction(self.db):
+                # sdk2.bind_task raises KeyError when the plan is unknown.
+                sdk2.bind_task(self.db, task_id, rule_id)
+            return
         with transaction(self.db):
             self.get(rule_id)
             self.db.execute("""INSERT INTO tasks_v1 VALUES(?,?)
@@ -107,15 +135,34 @@ class Runner:
 
     def run(self, task_id, batch_id, *, before_commit=None):
         with transaction(self.db, before_commit):
-            _legacy(self.db)
-            task = self.db.execute("SELECT rule_id FROM tasks_v1 WHERE task_id=?", (task_id,)).fetchone()
-            if task is None:
-                raise KeyError(task_id)
-            plan = Registry(self.db).get(task[0])
-            batch = self.db.execute("SELECT payload_json FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
-            if batch is None:
-                raise KeyError(batch_id)
-            results = sdk1.evaluate(plan, loads(batch[0]))
+            if _migrated(self.db):
+                binding = self.db.execute(
+                    "SELECT plan_id FROM sdk2_tasks WHERE task_id=?", (task_id,)).fetchone()
+                if binding is None:
+                    raise KeyError(task_id)
+                batch = self.db.execute(
+                    "SELECT payload_json FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+                if batch is None:
+                    raise KeyError(batch_id)
+                inputs = loads(batch[0])
+                # Unmodified SDK2 executes the saved DAG on this batch only.
+                relation = sdk2.execute(sdk2.get_plan(self.db, binding[0]), inputs)
+                records = sorted(relation.records(), key=lambda row: row["position"])
+                results = [row["value"] for row in records]
+            else:
+                _legacy(self.db)
+                task = self.db.execute(
+                    "SELECT rule_id FROM tasks_v1 WHERE task_id=?", (task_id,)).fetchone()
+                if task is None:
+                    raise KeyError(task_id)
+                plan = Registry(self.db).get(task[0])
+                batch = self.db.execute(
+                    "SELECT payload_json FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+                if batch is None:
+                    raise KeyError(batch_id)
+                results = sdk1.evaluate(plan, loads(batch[0]))
+            # Any evaluation error above rolls back the savepoint, so a failed
+            # run never publishes partial rows and keeps any prior publication.
             self.db.execute("""INSERT INTO publications VALUES(?,?,?)
                 ON CONFLICT(task_id,batch_id) DO UPDATE SET results_json=excluded.results_json""",
                             (task_id, batch_id, dumps(results)))
